@@ -1,12 +1,16 @@
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_video as gst_video;
-use gtk::prelude::*;
-use gtk::{Button, Box as GtkBox, Label, LevelBar, Scale, Window, WindowType, Orientation};
-use std::env;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::event::{Event, WindowEvent};
+use winit::event_loop::{ControlFlow, EventLoop};
+use winit::window::{Window, WindowBuilder};
+use wgpu::{Device, Queue, Surface, TextureFormat};
+use std::env;
+use raw_window_handle::HasRawWindowHandle;
 
 // Custom error type for better error handling
 #[derive(Debug)]
@@ -14,6 +18,7 @@ enum PlayerError {
     InitError(String),
     StreamError(String),
     ConnectionError(String),
+    WindowError(String),
 }
 
 impl std::fmt::Display for PlayerError {
@@ -22,6 +27,7 @@ impl std::fmt::Display for PlayerError {
             PlayerError::InitError(msg) => write!(f, "Initialization error: {}", msg),
             PlayerError::StreamError(msg) => write!(f, "Stream error: {}", msg),
             PlayerError::ConnectionError(msg) => write!(f, "Connection error: {}", msg),
+            PlayerError::WindowError(msg) => write!(f, "Window error: {}", msg),
         }
     }
 }
@@ -43,15 +49,19 @@ struct RtspPlayer {
     video_info: Arc<Mutex<Option<VideoInfo>>>,
     position: Arc<Mutex<u64>>,
     duration: Arc<Mutex<u64>>,
-    gui_controls: Arc<Mutex<Option<GuiControls>>>,
+    status_text: Arc<Mutex<String>>,
 }
 
-struct GuiControls {
-    play_button: Button,
-    position_scale: Scale,
-    buffer_level: LevelBar,
-    status_label: Label,
-    info_label: Label,
+struct GuiState {
+    device: Device,
+    queue: Queue,
+    surface: Surface,
+    surface_format: TextureFormat,
+    size: winit::dpi::PhysicalSize<u32>,
+    play_button_rect: (f32, f32, f32, f32), // x, y, width, height
+    pause_button_rect: (f32, f32, f32, f32),
+    is_seeking: bool,
+    seek_position: f32,
 }
 
 impl RtspPlayer {
@@ -61,11 +71,12 @@ impl RtspPlayer {
             return Err(Box::new(PlayerError::InitError("Failed to initialize GStreamer".into())));
         }
 
-        // Create an overlay sink for video rendering that can be embedded in GTK
+        // Create a more robust pipeline with better error handling and reconnection
+        // Use d3d11videosink for Windows DirectX rendering
         let pipeline_str = format!(
             "rtspsrc location={} latency=100 protocols=tcp+udp+http buffer-mode=auto retry=5 timeout=5000000 ! 
              rtpjitterbuffer ! queue max-size-buffers=3000 max-size-time=0 max-size-bytes=0 ! 
-             decodebin ! videoconvert ! gtksink name=videosink",
+             decodebin ! videoconvert ! d3d11videosink sync=true name=videosink",
             url
         );
 
@@ -81,131 +92,17 @@ impl RtspPlayer {
             video_info: Arc::new(Mutex::new(None)),
             position: Arc::new(Mutex::new(0)),
             duration: Arc::new(Mutex::new(0)),
-            gui_controls: Arc::new(Mutex::new(None)),
+            status_text: Arc::new(Mutex::new(String::from("Initializing..."))),
         })
-    }
-
-    fn setup_gui(&self) -> Result<Window, Box<dyn Error>> {
-        // Create the main window
-        let window = Window::new(WindowType::Toplevel);
-        window.set_title(&format!("RTSP Player - {}", self.url));
-        window.set_default_size(800, 600);
-        window.connect_delete_event(|_, _| {
-            gtk::main_quit();
-            Inhibit(false)
-        });
-
-        // Create main container
-        let main_box = GtkBox::new(Orientation::Vertical, 0);
-        window.add(&main_box);
-
-        // Get the video widget from the pipeline
-        let video_sink = self.pipeline
-            .by_name("videosink")
-            .ok_or_else(|| PlayerError::InitError("Could not find video sink".into()))?;
-        
-        let video_widget = video_sink
-            .property::<gtk::Widget>("widget")
-            .ok_or_else(|| PlayerError::InitError("Could not get video widget".into()))?;
-        
-        // Add the video widget to the container
-        main_box.pack_start(&video_widget, true, true, 0);
-
-        // Create controls
-        let controls_box = GtkBox::new(Orientation::Horizontal, 5);
-        controls_box.set_margin_top(10);
-        controls_box.set_margin_bottom(10);
-        controls_box.set_margin_start(10);
-        controls_box.set_margin_end(10);
-        main_box.pack_start(&controls_box, false, false, 0);
-
-        // Play/Pause button
-        let play_button = Button::with_label("Pause");
-        controls_box.pack_start(&play_button, false, false, 0);
-
-        // Position slider
-        let position_scale = Scale::with_range(Orientation::Horizontal, 0.0, 100.0, 1.0);
-        position_scale.set_draw_value(false);
-        position_scale.set_hexpand(true);
-        controls_box.pack_start(&position_scale, true, true, 0);
-
-        // Create status area
-        let status_box = GtkBox::new(Orientation::Horizontal, 5);
-        status_box.set_margin_start(10);
-        status_box.set_margin_end(10);
-        status_box.set_margin_bottom(10);
-        main_box.pack_start(&status_box, false, false, 0);
-
-        // Buffer level indicator
-        let buffer_label = Label::new(Some("Buffer:"));
-        status_box.pack_start(&buffer_label, false, false, 0);
-        
-        let buffer_level = LevelBar::new();
-        buffer_level.set_min_value(0.0);
-        buffer_level.set_max_value(100.0);
-        buffer_level.set_value(0.0);
-        buffer_level.set_size_request(100, -1);
-        status_box.pack_start(&buffer_level, false, false, 0);
-        
-        // Status label
-        let status_label = Label::new(Some("Initializing..."));
-        status_box.pack_start(&status_label, false, false, 10);
-        
-        // Video info label
-        let info_label = Label::new(None);
-        status_box.pack_end(&info_label, false, false, 0);
-
-        // Store controls for later access
-        *self.gui_controls.lock().unwrap() = Some(GuiControls {
-            play_button: play_button.clone(),
-            position_scale: position_scale.clone(),
-            buffer_level,
-            status_label,
-            info_label,
-        });
-
-        // Connect button signals
-        let player_ref = self.clone();
-        play_button.connect_clicked(move |button| {
-            if player_ref.is_playing() {
-                let _ = player_ref.pause();
-                button.set_label("Play");
-            } else {
-                let _ = player_ref.resume();
-                button.set_label("Pause");
-            }
-        });
-
-        // Connect position slider
-        let player_ref = self.clone();
-        position_scale.connect_value_changed(move |scale| {
-            let value = scale.value() as u64;
-            let duration = *player_ref.duration.lock().unwrap();
-            if duration > 0 {
-                let position = (value as f64 / 100.0) * (duration as f64);
-                let _ = player_ref.pipeline.seek_simple(
-                    gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
-                    position * gst::ClockTime::SECOND.nseconds() as f64,
-                );
-            }
-        });
-
-        // Show all widgets
-        window.show_all();
-
-        Ok(window)
     }
 
     fn play(&self) -> Result<(), Box<dyn Error>> {
         // Start the pipeline
         self.pipeline.set_state(gst::State::Playing)?;
         *self.is_playing.lock().unwrap() = true;
+        *self.status_text.lock().unwrap() = String::from("Playing");
         
-        // Update status
-        if let Some(controls) = &*self.gui_controls.lock().unwrap() {
-            controls.status_label.set_text("Playing");
-            controls.play_button.set_label("Pause");
-        }
+        println!("Stream started. Playing from {}", self.url);
         
         Ok(())
     }
@@ -213,35 +110,40 @@ impl RtspPlayer {
     fn pause(&self) -> Result<(), Box<dyn Error>> {
         self.pipeline.set_state(gst::State::Paused)?;
         *self.is_playing.lock().unwrap() = false;
+        *self.status_text.lock().unwrap() = String::from("Paused");
         
-        // Update status
-        if let Some(controls) = &*self.gui_controls.lock().unwrap() {
-            controls.status_label.set_text("Paused");
-        }
-        
+        println!("Playback paused.");
         Ok(())
     }
     
     fn resume(&self) -> Result<(), Box<dyn Error>> {
         self.pipeline.set_state(gst::State::Playing)?;
         *self.is_playing.lock().unwrap() = true;
+        *self.status_text.lock().unwrap() = String::from("Playing");
         
-        // Update status
-        if let Some(controls) = &*self.gui_controls.lock().unwrap() {
-            controls.status_label.set_text("Playing");
-        }
-        
+        println!("Playback resumed.");
         Ok(())
     }
     
     fn stop(&self) -> Result<(), Box<dyn Error>> {
         self.pipeline.set_state(gst::State::Null)?;
         *self.is_playing.lock().unwrap() = false;
+        *self.status_text.lock().unwrap() = String::from("Stopped");
         
-        // Update status
-        if let Some(controls) = &*self.gui_controls.lock().unwrap() {
-            controls.status_label.set_text("Stopped");
-            controls.play_button.set_label("Play");
+        println!("Playback stopped.");
+        Ok(())
+    }
+    
+    fn seek(&self, position_percent: f64) -> Result<(), Box<dyn Error>> {
+        let duration = *self.duration.lock().unwrap();
+        if duration > 0 {
+            let position = (position_percent / 100.0) * (duration as f64);
+            self.pipeline.seek_simple(
+                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                position * gst::ClockTime::SECOND.nseconds() as f64,
+            )?;
+            
+            println!("Seeking to {}%", position_percent);
         }
         
         Ok(())
@@ -256,40 +158,8 @@ impl RtspPlayer {
         let url_clone = self.url.clone();
         let is_playing = Arc::clone(&self.is_playing);
         let video_info = Arc::clone(&self.video_info);
-        let gui_controls = Arc::clone(&self.gui_controls);
-        let position = Arc::clone(&self.position);
-        let duration = Arc::clone(&self.duration);
+        let status_text = Arc::clone(&self.status_text);
         let pipeline_clone = self.pipeline.clone();
-        
-        // Set up a timeout for updating the position slider
-        let timeout_player = self.clone();
-        gtk::timeout_add(500, move || {
-            if timeout_player.is_playing() {
-                if let Some(controls) = &*timeout_player.gui_controls.lock().unwrap() {
-                    // Query position
-                    if let Ok(Some(pos)) = timeout_player.pipeline.query_position::<gst::ClockTime>() {
-                        let pos_secs = pos.seconds();
-                        *timeout_player.position.lock().unwrap() = pos_secs;
-                        
-                        // Get duration 
-                        if let Ok(Some(dur)) = timeout_player.pipeline.query_duration::<gst::ClockTime>() {
-                            let dur_secs = dur.seconds();
-                            *timeout_player.duration.lock().unwrap() = dur_secs;
-                            
-                            if dur_secs > 0 {
-                                // Update position slider without triggering the value-changed signal
-                                let slider_value = (pos_secs as f64 / dur_secs as f64) * 100.0;
-                                controls.position_scale.block_signal_handlers();
-                                controls.position_scale.set_value(slider_value);
-                                controls.position_scale.unblock_signal_handlers();
-                            }
-                        }
-                    }
-                }
-            }
-            
-            Continue(true)
-        });
         
         let _bus_watch = bus.add_watch(move |_, msg| {
             use gstreamer::MessageView;
@@ -297,18 +167,12 @@ impl RtspPlayer {
             match msg.view() {
                 MessageView::Eos(..) => {
                     println!("End of stream");
-                    if let Some(controls) = &*gui_controls.lock().unwrap() {
-                        controls.status_label.set_text("End of stream");
-                        controls.play_button.set_label("Play");
-                    }
                     *is_playing.lock().unwrap() = false;
+                    *status_text.lock().unwrap() = String::from("End of stream");
                 }
                 MessageView::Error(err) => {
                     println!("Error: {} ({:?})", err.error(), err.debug());
-                    
-                    if let Some(controls) = &*gui_controls.lock().unwrap() {
-                        controls.status_label.set_text(&format!("Error: {}", err.error()));
-                    }
+                    *status_text.lock().unwrap() = format!("Error: {}", err.error());
                     
                     // If currently playing, try to reconnect
                     if *is_playing.lock().unwrap() {
@@ -316,23 +180,34 @@ impl RtspPlayer {
                         if *attempts < 5 {
                             *attempts += 1;
                             println!("Attempting to reconnect (attempt {}/5)...", *attempts);
-                            
-                            if let Some(controls) = &*gui_controls.lock().unwrap() {
-                                controls.status_label.set_text(&format!("Reconnecting ({}/5)...", *attempts));
-                            }
+                            *status_text.lock().unwrap() = format!("Reconnecting ({}/5)...", *attempts);
                             
                             // Reset the pipeline
                             let _ = pipeline_clone.set_state(gst::State::Null);
                             std::thread::sleep(Duration::from_secs(2));
                             
-                            // Try to play again
-                            let _ = pipeline_clone.set_state(gst::State::Playing);
+                            // Create a new source element
+                            let src_str = format!(
+                                "rtspsrc location={} latency=100 protocols=tcp+udp+http buffer-mode=auto retry=5 timeout=5000000",
+                                url_clone
+                            );
+                            
+                            match gst::parse::launch(&src_str) {
+                                Ok(_) => {
+                                    println!("Reconnection attempt successful");
+                                    let _ = pipeline_clone.set_state(gst::State::Playing);
+                                }
+                                Err(e) => {
+                                    println!("Failed to reconnect: {}", e);
+                                    if *attempts >= 5 {
+                                        println!("Max reconnection attempts reached, giving up");
+                                        *status_text.lock().unwrap() = String::from("Connection failed");
+                                    }
+                                }
+                            }
                         } else {
                             println!("Max reconnection attempts reached, giving up");
-                            if let Some(controls) = &*gui_controls.lock().unwrap() {
-                                controls.status_label.set_text("Connection failed");
-                            }
-                            *is_playing.lock().unwrap() = false;
+                            *status_text.lock().unwrap() = String::from("Connection failed");
                         }
                     }
                 }
@@ -347,27 +222,19 @@ impl RtspPlayer {
                 }
                 MessageView::StreamStart(_) => {
                     println!("Stream started successfully");
-                    if let Some(controls) = &*gui_controls.lock().unwrap() {
-                        controls.status_label.set_text("Stream started");
-                    }
+                    *status_text.lock().unwrap() = String::from("Stream started");
                 }
                 MessageView::Buffering(buffering) => {
                     let percent = buffering.percent();
                     println!("Buffering... {}%", percent);
-                    
-                    if let Some(controls) = &*gui_controls.lock().unwrap() {
-                        controls.buffer_level.set_value(percent as f64);
-                        controls.status_label.set_text(&format!("Buffering... {}%", percent));
-                    }
+                    *status_text.lock().unwrap() = format!("Buffering... {}%", percent);
                     
                     // Pause the pipeline if buffering and resume when done
                     if percent < 100 {
                         let _ = pipeline_clone.set_state(gst::State::Paused);
                     } else if *is_playing.lock().unwrap() {
                         let _ = pipeline_clone.set_state(gst::State::Playing);
-                        if let Some(controls) = &*gui_controls.lock().unwrap() {
-                            controls.status_label.set_text("Playing");
-                        }
+                        *status_text.lock().unwrap() = String::from("Playing");
                     }
                 }
                 MessageView::Element(element) => {
@@ -390,11 +257,6 @@ impl RtspPlayer {
                                 
                                 println!("Video info: {}x{} @ {:.2} fps, codec: {}", 
                                     width, height, framerate, codec);
-                                    
-                                if let Some(controls) = &*gui_controls.lock().unwrap() {
-                                    controls.info_label.set_text(&format!("{}x{} @ {:.2} fps ({})", 
-                                        width, height, framerate, codec));
-                                }
                             }
                         }
                     }
@@ -416,24 +278,202 @@ impl RtspPlayer {
         *self.is_playing.lock().unwrap()
     }
     
-    fn clone(&self) -> Self {
-        RtspPlayer {
-            pipeline: self.pipeline.clone(),
-            is_playing: Arc::clone(&self.is_playing),
-            reconnect_attempts: Arc::clone(&self.reconnect_attempts),
-            url: self.url.clone(),
-            video_info: Arc::clone(&self.video_info),
-            position: Arc::clone(&self.position),
-            duration: Arc::clone(&self.duration),
-            gui_controls: Arc::clone(&self.gui_controls),
+    fn get_position_percent(&self) -> f64 {
+        let position = *self.position.lock().unwrap();
+        let duration = *self.duration.lock().unwrap();
+        
+        if duration > 0 {
+            (position as f64 / duration as f64) * 100.0
+        } else {
+            0.0
+        }
+    }
+    
+    fn get_status_text(&self) -> String {
+        self.status_text.lock().unwrap().clone()
+    }
+    
+    fn update_position(&self) {
+        if let Ok(Some(pos)) = self.pipeline.query_position::<gst::ClockTime>() {
+            let pos_secs = pos.seconds();
+            *self.position.lock().unwrap() = pos_secs;
+            
+            // Get duration 
+            if let Ok(Some(dur)) = self.pipeline.query_duration::<gst::ClockTime>() {
+                let dur_secs = dur.seconds();
+                *self.duration.lock().unwrap() = dur_secs;
+            }
         }
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    // Initialize GTK
-    gtk::init()?;
+fn create_window_and_device() -> Result<(EventLoop<()>, Window, Device, Queue, Surface, TextureFormat), Box<dyn Error>> {
+    let event_loop = EventLoop::new();
     
+    let window = WindowBuilder::new()
+        .with_title("RTSP Player")
+        .with_inner_size(LogicalSize::new(800.0, 600.0))
+        .build(&event_loop)?;
+    
+    // Set up wgpu instance
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        dx12_shader_compiler: Default::default(),
+    });
+    
+    // Create surface
+    let surface = unsafe { instance.create_surface(&window) }?;
+    
+    // Request adapter
+    let adapter = pollster::block_on(instance.request_adapter(
+        &wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        },
+    )).ok_or_else(|| PlayerError::WindowError("Failed to find an appropriate adapter".into()))?;
+    
+    // Create device and queue
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            features: wgpu::Features::empty(),
+            limits: wgpu::Limits::default(),
+            label: None,
+        },
+        None,
+    ))?;
+    
+    // Configure surface
+    let size = window.inner_size();
+    let surface_caps = surface.get_capabilities(&adapter);
+    let surface_format = surface_caps.formats.iter()
+        .copied()
+        .find(|f| f.is_srgb())
+        .unwrap_or(surface_caps.formats[0]);
+    
+    let config = wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: surface_format,
+        width: size.width,
+        height: size.height,
+        present_mode: wgpu::PresentMode::Fifo,
+        alpha_mode: wgpu::CompositeAlphaMode::Auto,
+        view_formats: vec![],
+    };
+    
+    surface.configure(&device, &config);
+    
+    Ok((event_loop, window, device, queue, surface, surface_format))
+}
+
+fn run_gui_loop(
+    event_loop: EventLoop<()>,
+    window: Window,
+    player: Arc<RtspPlayer>
+) -> Result<(), Box<dyn Error>> {
+    // Start the GStreamer pipeline
+    player.play()?;
+    
+    // Create position update thread
+    let player_clone = Arc::clone(&player);
+    std::thread::spawn(move || {
+        loop {
+            if player_clone.is_playing() {
+                player_clone.update_position();
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+    
+    // Set up GUI state
+    let mut gui_state = {
+        let size = window.inner_size();
+        
+        // Define button positions and sizes
+        let play_button_rect = (20.0, size.height as f32 - 60.0, 80.0, 40.0);
+        let pause_button_rect = (110.0, size.height as f32 - 60.0, 80.0, 40.0);
+        
+        GuiState {
+            device: wgpu::Device::new(),
+            queue: wgpu::Queue::new(),
+            surface: wgpu::Surface::new(),
+            surface_format: wgpu::TextureFormat::Rgba8Unorm,
+            size,
+            play_button_rect,
+            pause_button_rect,
+            is_seeking: false,
+            seek_position: 0.0,
+        }
+    };
+    
+    // Run the event loop
+    event_loop.run(move |event, _, control_flow| {
+        *control_flow = ControlFlow::Poll;
+        
+        match event {
+            Event::WindowEvent { window_id, event } if window_id == window.id() => {
+                match event {
+                    WindowEvent::CloseRequested => {
+                        let _ = player.stop();
+                        *control_flow = ControlFlow::Exit;
+                    }
+                    WindowEvent::Resized(new_size) => {
+                        gui_state.size = new_size;
+                        // Update seek bar and button positions based on new size
+                        gui_state.play_button_rect.1 = new_size.height as f32 - 60.0;
+                        gui_state.pause_button_rect.1 = new_size.height as f32 - 60.0;
+                    }
+                    WindowEvent::MouseInput { state: winit::event::ElementState::Pressed, .. } => {
+                        // Check if buttons were clicked
+                        if let Some(cursor_position) = window.cursor_position() {
+                            // Check play button
+                            if point_in_rect(cursor_position, gui_state.play_button_rect) {
+                                let _ = player.resume();
+                            }
+                            // Check pause button
+                            else if point_in_rect(cursor_position, gui_state.pause_button_rect) {
+                                let _ = player.pause();
+                            }
+                            // Check seek bar (positioned at the bottom of the window)
+                            else {
+                                let seek_bar_y = gui_state.size.height as f32 - 100.0;
+                                let seek_bar_height = 20.0;
+                                
+                                if cursor_position.y >= seek_bar_y && cursor_position.y <= seek_bar_y + seek_bar_height {
+                                    let seek_percent = (cursor_position.x as f32 / gui_state.size.width as f32) * 100.0;
+                                    gui_state.is_seeking = true;
+                                    gui_state.seek_position = seek_percent;
+                                    
+                                    // Perform the seek
+                                    let _ = player.seek(seek_percent as f64);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::RedrawRequested(window_id) if window_id == window.id() => {
+                // This would be where we'd redraw our UI if needed
+                // Since we're using GStreamer's d3d11videosink, it will handle the video rendering
+                // We would add UI elements on top if needed
+            }
+            Event::MainEventsCleared => {
+                // Request a redraw
+                window.request_redraw();
+            }
+            _ => {}
+        }
+    });
+}
+
+fn point_in_rect(point: PhysicalPosition<f64>, rect: (f32, f32, f32, f32)) -> bool {
+    let (x, y, width, height) = rect;
+    point.x >= x as f64 && point.x <= (x + width) as f64 && 
+    point.y >= y as f64 && point.y <= (y + height) as f64
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
     // Get the RTSP URL from command line or use a default
     let args: Vec<String> = env::args().collect();
     let rtsp_url = if args.len() > 1 {
@@ -447,20 +487,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Create the RTSP player
     let player = RtspPlayer::new(&rtsp_url)?;
     
-    // Set up GUI
-    let _window = player.setup_gui()?;
-    
     // Set up message handling
     player.setup_message_handling()?;
     
-    // Start playback
-    player.play()?;
+    // Set up Ctrl+C handler
+    let player_for_signal = Arc::new(player);
+    let player_clone = Arc::clone(&player_for_signal);
     
-    // Start the GTK main loop
-    gtk::main();
+    ctrlc::set_handler(move || {
+        println!("\nReceived Ctrl+C, shutting down...");
+        let _ = player_clone.stop();
+        std::process::exit(0);
+    })?;
+
+    // Create window and GUI
+    let (event_loop, window, device, queue, surface, surface_format) = create_window_and_device()?;
     
-    // Clean up
-    player.stop()?;
+    // Run the main event loop
+    run_gui_loop(event_loop, window, player_for_signal)?;
     
     Ok(())
 }
