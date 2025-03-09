@@ -2,5 +2,11 @@
 name = "rtsp-player"
 version = "0.1.0"
 edition = "2024"
+description = "Stream videos to a window."
 
 [dependencies]
+gstreamer = "0.23.5"
+gstreamer-video = "0.23.5"
+glib = "0.20.9"
+ctrlc = "3.2.0"
+
