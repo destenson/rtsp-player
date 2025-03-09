@@ -1,16 +1,22 @@
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use gstreamer_video::prelude::VideoOverlayExtManual;
 use gstreamer_video as gst_video;
-use std::error::Error;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{Event, WindowEvent};
-use winit::event_loop::{ControlFlow, EventLoop};
-use winit::window::{Window, WindowBuilder};
-use wgpu::{Device, Queue, Surface, TextureFormat};
 use std::env;
-use raw_window_handle::HasRawWindowHandle;
+use std::error::Error;
+use std::os::raw::c_void;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{channel, Sender, Receiver};
+use std::time::Duration;
+use windows::{
+    core::*,
+    Win32::Foundation::*,
+    Win32::UI::Controls::*,
+    Win32::UI::WindowsAndMessaging::*,
+    Win32::Graphics::Gdi::*,
+    Win32::System::LibraryLoader::GetModuleHandleA,
+};
+
 
 // Custom error type for better error handling
 #[derive(Debug)]
@@ -18,7 +24,7 @@ enum PlayerError {
     InitError(String),
     StreamError(String),
     ConnectionError(String),
-    WindowError(String),
+    WindowsError(String),
 }
 
 impl std::fmt::Display for PlayerError {
@@ -27,18 +33,42 @@ impl std::fmt::Display for PlayerError {
             PlayerError::InitError(msg) => write!(f, "Initialization error: {}", msg),
             PlayerError::StreamError(msg) => write!(f, "Stream error: {}", msg),
             PlayerError::ConnectionError(msg) => write!(f, "Connection error: {}", msg),
-            PlayerError::WindowError(msg) => write!(f, "Window error: {}", msg),
+            PlayerError::WindowsError(msg) => write!(f, "Windows API error: {}", msg),
         }
     }
 }
 
 impl Error for PlayerError {}
 
+#[derive(Debug, Default, Clone, PartialEq)]
 struct VideoInfo {
     width: i32,
     height: i32,
     framerate: f64,
     codec: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GuiControls {
+    window: HWND,
+    video_window: HWND,
+    play_button: HWND,
+    pause_button: HWND,
+    stop_button: HWND,
+    seekbar: HWND,
+    status_text: HWND,
+}
+
+enum PlayerMessage {
+    EndOfStream,
+    Error(String),
+    StreamStarted,
+    Buffering(i32),
+    StateChanged(gst::State),
+    VideoInfo(i32, i32, f64, String),
+    Reconnecting(u32),
+    ConnectionFailed,
+    PositionUpdate(u64, u64), // position, duration
 }
 
 struct RtspPlayer {
@@ -49,30 +79,28 @@ struct RtspPlayer {
     video_info: Arc<Mutex<Option<VideoInfo>>>,
     position: Arc<Mutex<u64>>,
     duration: Arc<Mutex<u64>>,
-    status_text: Arc<Mutex<String>>,
+    gui_controls: Arc<Mutex<Option<GuiControls>>>,
+    video_sink_widget: Arc<Mutex<Option<HWND>>>,
+    message_sender: Arc<Mutex<Sender<PlayerMessage>>>,
+    message_receiver: Receiver<PlayerMessage>,
 }
 
-struct GuiState {
-    device: Device,
-    queue: Queue,
-    surface: Surface,
-    surface_format: TextureFormat,
-    size: winit::dpi::PhysicalSize<u32>,
-    play_button_rect: (f32, f32, f32, f32), // x, y, width, height
-    pause_button_rect: (f32, f32, f32, f32),
-    is_seeking: bool,
-    seek_position: f32,
-}
+const ID_PLAY_BUTTON: u16 = 101;
+const ID_PAUSE_BUTTON: u16 = 102;
+const ID_STOP_BUTTON: u16 = 103;
+const ID_SEEKBAR: u16 = 104;
+const ID_STATUS_TEXT: u16 = 105;
+const ID_VIDEO_WINDOW: u16 = 106;
 
 impl RtspPlayer {
-    fn new(url: &str) -> Result<Self, Box<dyn Error>> {
+    fn new(url: &str) -> std::result::Result<Self, Box<dyn Error>> {
         // Initialize GStreamer if not already initialized
         if gst::init().is_err() {
             return Err(Box::new(PlayerError::InitError("Failed to initialize GStreamer".into())));
         }
 
         // Create a more robust pipeline with better error handling and reconnection
-        // Use d3d11videosink for Windows DirectX rendering
+        // Use d3dvideosink for Windows DirectX rendering
         let pipeline_str = format!(
             "rtspsrc location={} latency=100 protocols=tcp+udp+http buffer-mode=auto retry=5 timeout=5000000 ! 
              rtpjitterbuffer ! queue max-size-buffers=3000 max-size-time=0 max-size-bytes=0 ! 
@@ -84,6 +112,8 @@ impl RtspPlayer {
             .dynamic_cast::<gst::Pipeline>()
             .map_err(|_| PlayerError::InitError("Failed to create pipeline".into()))?;
 
+        let (sender, receiver) = channel::<PlayerMessage>();
+
         Ok(RtspPlayer {
             pipeline,
             is_playing: Arc::new(Mutex::new(false)),
@@ -92,74 +122,465 @@ impl RtspPlayer {
             video_info: Arc::new(Mutex::new(None)),
             position: Arc::new(Mutex::new(0)),
             duration: Arc::new(Mutex::new(0)),
-            status_text: Arc::new(Mutex::new(String::from("Initializing..."))),
+            gui_controls: Arc::new(Mutex::new(None)),
+            video_sink_widget: Arc::new(Mutex::new(None)),
+            message_sender: Arc::new(Mutex::new(sender)),
+            message_receiver: receiver,
         })
     }
 
-    fn play(&self) -> Result<(), Box<dyn Error>> {
+    fn create_gui(&self) -> std::result::Result<(), Box<dyn Error>> {
+        let instance = unsafe { GetModuleHandleA(None)? };
+        
+        // Register window class
+        let class_name = PCSTR(b"RTSPPlayerWindowClass\0".as_ptr());
+        // let hbrBackground = HBRUSH(COLOR_WINDOW.0);
+        let hInstance = HINSTANCE(instance.0);
+        
+        let wc = WNDCLASSA {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(window_proc),
+            hInstance,
+            lpszClassName: class_name,
+            hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? },
+            // hbrBackground,
+            ..Default::default()
+        };
+        
+        if unsafe { RegisterClassA(&wc) } == 0 {
+            return Err(Box::new(PlayerError::WindowsError("Failed to register window class".into())));
+        }
+        
+        // Store self pointer for the window procedure to access
+        let player_ptr = Box::into_raw(Box::new(self as *const _));
+        
+        // Create main window
+        let window = unsafe {
+            CreateWindowExA(
+                WINDOW_EX_STYLE::default(),
+                class_name,
+                PCSTR(b"RTSP Player\0".as_ptr()),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
+                None,
+                None,
+                Some(hInstance),
+                Some(player_ptr as *const _),
+            )
+        }?;
+        
+        if window.0.is_null() {
+            return Err(Box::new(PlayerError::WindowsError("Failed to create window".into())));
+        }
+
+        // let hwndparent = HWND(window.0);
+        // let hmenu = HMENU(ID_VIDEO_WINDOW as isize);
+        // let hmenu = unsafe {CreateMenu()}?;
+        // Menu
+        
+        // Create video window
+        let video_window = unsafe {
+            CreateWindowExA(
+                WINDOW_EX_STYLE::default(),
+                PCSTR(b"STATIC\0".as_ptr()),
+                PCSTR(b"\0".as_ptr()),
+                WS_CHILD | WS_VISIBLE | WS_BORDER,
+                0, 0, 800, 500,
+                Some(window),
+                Some(HMENU(ID_VIDEO_WINDOW as *mut c_void)),
+                Some(hInstance),
+                None,
+            )
+        }?;
+
+        const BS_DEFPUSHBUTTON: WINDOW_STYLE = WINDOW_STYLE(windows::Win32::UI::WindowsAndMessaging::BS_DEFPUSHBUTTON as u32);
+        
+        // Create control buttons
+        let play_button = unsafe {
+            CreateWindowExA(
+                WINDOW_EX_STYLE::default(),
+                PCSTR(b"BUTTON\0".as_ptr()),
+                PCSTR(b"Play\0".as_ptr()),
+                WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
+                10, 510, 100, 30,
+                Some(window),
+                None, //Some(HMENU(ID_PLAY_BUTTON as isize)),
+                Some(hInstance),
+                None,
+            )
+        }?;
+        
+        let pause_button = unsafe {
+            CreateWindowExA(
+                WINDOW_EX_STYLE::default(),
+                PCSTR(b"BUTTON\0".as_ptr()),
+                PCSTR(b"Pause\0".as_ptr()),
+                WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
+                120, 510, 100, 30,
+                Some(window),
+                None, //HMENU(ID_PAUSE_BUTTON as isize),
+                Some(hInstance),
+                None,
+            )
+        }?;
+        
+        let stop_button = unsafe {
+            CreateWindowExA(
+                WINDOW_EX_STYLE::default(),
+                PCSTR(b"BUTTON\0".as_ptr()),
+                PCSTR(b"Stop\0".as_ptr()),
+                WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
+                230, 510, 100, 30,
+                Some(window),
+                None, //HMENU(ID_STOP_BUTTON as isize),
+                Some(hInstance),
+                None,
+            )
+        }?;
+        
+        // Create seekbar (trackbar control)
+        let seekbar = unsafe {
+            CreateWindowExA(
+                WINDOW_EX_STYLE::default(),
+                PCSTR(b"msctls_trackbar32\0".as_ptr()),
+                PCSTR(b"\0".as_ptr()),
+                WS_CHILD | WS_VISIBLE,// | TBS_HORZ,
+                340, 510, 300, 30,
+                Some(window),
+                None, //HMENU(ID_SEEKBAR as isize),
+                Some(hInstance),
+                None,
+            )
+        }?;
+        
+        // Initialize seekbar range
+        unsafe {
+            SendMessageA(seekbar, TBM_SETRANGE, WPARAM(0), LPARAM(MAKELONG(0, 1000) as isize));
+        }
+        
+        // Create status text
+        let status_text = unsafe {
+            CreateWindowExA(
+                WINDOW_EX_STYLE::default(),
+                PCSTR(b"STATIC\0".as_ptr()),
+                PCSTR(b"Ready\0".as_ptr()),
+                WS_CHILD | WS_VISIBLE,// | SS_LEFT,
+                10, 550, 780, 20,
+                Some(window),
+                None, //HMENU(ID_STATUS_TEXT as isize),
+                Some(hInstance),
+                None,
+            )
+        }?;
+        
+        // Store controls
+        *self.gui_controls.lock().unwrap() = Some(GuiControls {
+            window,
+            video_window,
+            play_button,
+            pause_button,
+            stop_button,
+            seekbar,
+            status_text,
+        });
+        
+        // Make the window visible
+        unsafe {
+            check_win_err()?;
+            let r = ShowWindow(window, SW_SHOW);
+            println!("ShowWindow result: {}", r.0);
+            check_win_err()?;
+            let r = UpdateWindow(window);
+            println!("UpdateWindow result: {}", r.0);
+            check_win_err()?;
+        }
+        
+        // Set up the GStreamer pipeline to render to our window
+        // For d3dvideosink, we need to set the window handle
+        let video_sink = self.pipeline
+            .by_name("videosink")
+            .ok_or_else(|| PlayerError::InitError("Could not find video sink".into()))?;
+
+        // use the set_window_handle() function on the GstOverlay interface
+        let video_sink = video_sink.dynamic_cast::<gst_video::VideoSink>().unwrap();
+        // Set the window handle on the video sink
+        let video_sink = video_sink.dynamic_cast::<gst_video::VideoOverlay>().unwrap();
+
+        unsafe { video_sink.set_window_handle(video_window.0 as usize) };
+        
+        // video_sink.call_async_future(
+        //     "set_window_handle",
+        //     &[&video_window.0 as &dyn ToValue],
+        // )?;
+        // // Set the window handle on the video sink
+        // video_sink.set_property("window-handle", video_window.0 as u64);
+        
+        // Store video window
+        *self.video_sink_widget.lock().unwrap() = Some(video_window);
+        
+        Ok(())
+    }
+
+    fn play(&self) -> std::result::Result<(), Box<dyn Error>> {
         // Start the pipeline
         self.pipeline.set_state(gst::State::Playing)?;
         *self.is_playing.lock().unwrap() = true;
-        *self.status_text.lock().unwrap() = String::from("Playing");
         
-        println!("Stream started. Playing from {}", self.url);
-        
-        Ok(())
-    }
-    
-    fn pause(&self) -> Result<(), Box<dyn Error>> {
-        self.pipeline.set_state(gst::State::Paused)?;
-        *self.is_playing.lock().unwrap() = false;
-        *self.status_text.lock().unwrap() = String::from("Paused");
-        
-        println!("Playback paused.");
-        Ok(())
-    }
-    
-    fn resume(&self) -> Result<(), Box<dyn Error>> {
-        self.pipeline.set_state(gst::State::Playing)?;
-        *self.is_playing.lock().unwrap() = true;
-        *self.status_text.lock().unwrap() = String::from("Playing");
-        
-        println!("Playback resumed.");
-        Ok(())
-    }
-    
-    fn stop(&self) -> Result<(), Box<dyn Error>> {
-        self.pipeline.set_state(gst::State::Null)?;
-        *self.is_playing.lock().unwrap() = false;
-        *self.status_text.lock().unwrap() = String::from("Stopped");
-        
-        println!("Playback stopped.");
-        Ok(())
-    }
-    
-    fn seek(&self, position_percent: f64) -> Result<(), Box<dyn Error>> {
-        let duration = *self.duration.lock().unwrap();
-        if duration > 0 {
-            let position = (position_percent / 100.0) * (duration as f64);
-            self.pipeline.seek_simple(
-                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
-                position * gst::ClockTime::SECOND.nseconds() as f64,
-            )?;
-            
-            println!("Seeking to {}%", position_percent);
+        // Update status
+        if let Some(controls) = &*self.gui_controls.lock().unwrap() {
+            unsafe {
+                SetWindowTextA(controls.status_text, PCSTR(b"Playing\0".as_ptr()));
+            }
         }
         
         Ok(())
     }
     
-    fn setup_message_handling(&self) -> Result<(), Box<dyn Error>> {
+    fn pause(&self) -> std::result::Result<(), Box<dyn Error>> {
+        self.pipeline.set_state(gst::State::Paused)?;
+        *self.is_playing.lock().unwrap() = false;
+        
+        // Update status
+        if let Some(controls) = &*self.gui_controls.lock().unwrap() {
+            unsafe {
+                SetWindowTextA(controls.status_text, PCSTR(b"Paused\0".as_ptr()));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn resume(&self) -> std::result::Result<(), Box<dyn Error>> {
+        self.pipeline.set_state(gst::State::Playing)?;
+        *self.is_playing.lock().unwrap() = true;
+        
+        // Update status
+        if let Some(controls) = &*self.gui_controls.lock().unwrap() {
+            unsafe {
+                SetWindowTextA(controls.status_text, PCSTR(b"Playing\0".as_ptr()));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn stop(&self) -> std::result::Result<(), Box<dyn Error>> {
+        self.pipeline.set_state(gst::State::Null)?;
+        *self.is_playing.lock().unwrap() = false;
+        
+        // Update status
+        if let Some(controls) = &*self.gui_controls.lock().unwrap() {
+            unsafe {
+                SetWindowTextA(controls.status_text, PCSTR(b"Stopped\0".as_ptr()));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    fn seek(&self, position_percent: f64) -> std::result::Result<(), Box<dyn Error>> {
+        let duration = *self.duration.lock().unwrap();
+        if duration > 0 {
+            let position = gst::ClockTime::from_nseconds((position_percent * duration as f64) as u64);
+            self.pipeline.seek_simple(
+                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                position,
+            )?;
+        }
+        Ok(())
+    }
+    
+    // fn setup_message_handling(&self) -> std::result::Result<(), Box<dyn Error>> {
+    //     let bus = self.pipeline.bus().ok_or_else(|| 
+    //         PlayerError::InitError("Failed to get pipeline bus".into())
+    //     )?;
+    //     
+    //     let reconnect_attempts = Arc::clone(&self.reconnect_attempts);
+    //     let url_clone = self.url.clone();
+    //     let is_playing = Arc::clone(&self.is_playing);
+    //     let video_info = Arc::clone(&self.video_info);
+    //     let gui_controls = Arc::clone(&self.gui_controls);
+    //     let position = Arc::clone(&self.position);
+    //     let duration = Arc::clone(&self.duration);
+    //     let pipeline_clone = self.pipeline.clone();
+    //     
+    //     // Set up a timer for updating the position slider
+    //     if let Some(controls) = &*gui_controls.lock().unwrap() {
+    //         let window = controls.window;
+    //         unsafe {
+    //             SetTimer(Some(window), 1, 500, None);
+    //         }
+    //     }
+    //     
+    //     let _bus_watch = bus.add_watch(|_, msg| {
+    //         use gstreamer::MessageView;
+    //         // let gui_controls = gui_controls.get_mut().expect("could not get gui controls").expect("GUI controls not initialized").as_ref();
+    //         (move || {
+    //             match msg.view() {
+    //                 MessageView::Eos(..) => {
+    //                     println!("End of stream");
+    //                     // let controls = gui_controls.clone();
+    //                     if let Some(controls) = gui_controls.lock().unwrap().as_ref() {
+    //                         unsafe {
+    //                             SetWindowTextA(controls.status_text, PCSTR(b"End of stream\0".as_ptr()));
+    //                         }
+    //                     }
+    //                     *is_playing.lock().unwrap() = false;
+    //                 }
+    //                 // MessageView::Error(err) => {
+    //                 //     println!("Error: {} ({:?})", err.error(), err.debug());
+    //                 //     
+    //                 //     let controls = gui_controls.clone();
+    //                 //     // if let Some(controls) = &*gui_controls.lock().unwrap() {
+    //                 //         let error_msg = format!("Error: {}\0", err.error());
+    //                 //         unsafe {
+    //                 //             SetWindowTextA(controls.status_text, PCSTR(error_msg.as_ptr()));
+    //                 //         }
+    //                 //     // }
+    //                 //     
+    //                 //     // If currently playing, try to reconnect
+    //                 //     if *is_playing.lock().unwrap() {
+    //                 //         let mut attempts = reconnect_attempts.lock().unwrap();
+    //                 //         if *attempts < 5 {
+    //                 //             *attempts += 1;
+    //                 //             println!("Attempting to reconnect (attempt {}/5)...", *attempts);
+    //                 //             
+    //                 //             let controls = gui_controls.clone();
+    //                 //             // if let Some(controls) = &*gui_controls.lock().unwrap() {
+    //                 //                 let reconnect_msg = format!("Reconnecting ({}/5)...\0", *attempts);
+    //                 //                 unsafe {
+    //                 //                     SetWindowTextA(controls.status_text, PCSTR(reconnect_msg.as_ptr()));
+    //                 //                 }
+    //                 //             // }
+    //                 //             
+    //                 //             // Reset the pipeline
+    //                 //             let _ = pipeline_clone.set_state(gst::State::Null);
+    //                 //             std::thread::sleep(Duration::from_secs(2));
+    //                 //             
+    //                 //             // Try to play again
+    //                 //             let _ = pipeline_clone.set_state(gst::State::Playing);
+    //                 //         } else {
+    //                 //             println!("Max reconnection attempts reached, giving up");
+    //                 //             let controls = gui_controls.clone();
+    //                 //             // if let Some(controls) = &*gui_controls.lock().unwrap() {
+    //                 //                 unsafe {
+    //                 //                     SetWindowTextA(controls.status_text, PCSTR(b"Connection failed\0".as_ptr()));
+    //                 //                 }
+    //                 //             // }
+    //                 //             *is_playing.lock().unwrap() = false;
+    //                 //         }
+    //                 //     }
+    //                 // }
+    //                 // MessageView::StateChanged(state_changed) => {
+    //                 //     // Only process messages from the pipeline
+    //                 //     if let Some(pipeline) = msg.src().and_then(|s| s.dynamic_cast::<gst::Pipeline>().ok()) {
+    //                 //         if pipeline == pipeline_clone && state_changed.current() == gst::State::Playing {
+    //                 //             // Reset reconnect counter when we successfully reach playing state
+    //                 //             *reconnect_attempts.lock().unwrap() = 0;
+    //                 //         }
+    //                 //     }
+    //                 // }
+    //                 // MessageView::StreamStart(_) => {
+    //                 //     println!("Stream started successfully");
+    //                 //     let controls = gui_controls.clone();
+    //                 //     // if let Some(controls) = &*gui_controls.lock().unwrap() {
+    //                 //         unsafe {
+    //                 //             SetWindowTextA(controls.status_text, PCSTR(b"Stream started\0".as_ptr()));
+    //                 //         }
+    //                 //     // }
+    //                 // }
+    //                 // MessageView::Buffering(buffering) => {
+    //                 //     let percent = buffering.percent();
+    //                 //     println!("Buffering... {}%", percent);
+    //                 //     
+    //                 //     let controls = gui_controls.clone();
+    //                 //     // if let Some(controls) = &*gui_controls.lock().unwrap() {
+    //                 //         let buffer_msg = format!("Buffering... {}%\0", percent);
+    //                 //         unsafe {
+    //                 //             SetWindowTextA(controls.status_text, PCSTR(buffer_msg.as_ptr()));
+    //                 //         }
+    //                 //     // }
+    //                 //     
+    //                 //     // Pause the pipeline if buffering and resume when done
+    //                 //     if percent < 100 {
+    //                 //         let _ = pipeline_clone.set_state(gst::State::Paused);
+    //                 //     } else if *is_playing.lock().unwrap() {
+    //                 //         let _ = pipeline_clone.set_state(gst::State::Playing);
+    //                 //         let controls = gui_controls.clone();
+    //                 //         // if let Some(controls) = &*gui_controls.lock().unwrap() {
+    //                 //             unsafe {
+    //                 //                 SetWindowTextA(controls.status_text, PCSTR(b"Playing\0".as_ptr()));
+    //                 //             }
+    //                 //         // }
+    //                 //     }
+    //                 // }
+    //                 // MessageView::Element(element) => {
+    //                 //     // Extract video information when available
+    //                 //     if let Some(structure) = element.structure() {
+    //                 //         if structure.name() == "video-info" {
+    //                 //             if let (Some(width), Some(height), Some(framerate), Some(codec)) = (
+    //                 //                 structure.get::<i32>("width").ok(),
+    //                 //                 structure.get::<i32>("height").ok(),
+    //                 //                 structure.get::<f64>("framerate").ok(),
+    //                 //                 structure.get::<String>("codec").ok(),
+    //                 //             ) {
+    //                 //                 let mut info = video_info.lock().unwrap();
+    //                 //                 *info = Some(VideoInfo {
+    //                 //                     width,
+    //                 //                     height,
+    //                 //                     framerate,
+    //                 //                     codec,
+    //                 //                 });
+    //                 //                 
+    //                 //                 println!("Video info: {}x{} @ {:.2} fps, codec: {}", 
+    //                 //                     width, height, framerate, codec);
+    //                 //                     
+    //                 //                 let controls = gui_controls.clone();
+    //                 //                 // if let Some(controls) = &*gui_controls.lock().unwrap() {
+    //                 //                     let info_text = format!("{}x{} @ {:.2} fps ({})\0", 
+    //                 //                         width, height, framerate, codec);
+    //                 //                     unsafe {
+    //                 //                         SetWindowTextA(controls.status_text, PCSTR(info_text.as_ptr()));
+    //                 //                     }
+    //                 //                 // }
+    //                 //             }
+    //                 //         }
+    //                 //     }
+    //                 // }
+    //                 MessageView::Qos(_) => {
+    //                     // We could display QoS statistics here if needed
+    //                 }
+    //                 _ => (),
+    //             }
+    //             
+    //         })();
+    //         glib::ControlFlow::Continue
+    //     })?;
+    //     
+    //     Ok(())
+    // }
+    
+    fn setup_message_handling(&self) -> std::result::Result<(), Box<dyn Error>> {
         let bus = self.pipeline.bus().ok_or_else(|| 
             PlayerError::InitError("Failed to get pipeline bus".into())
         )?;
         
-        let reconnect_attempts = Arc::clone(&self.reconnect_attempts);
-        let url_clone = self.url.clone();
-        let is_playing = Arc::clone(&self.is_playing);
-        let video_info = Arc::clone(&self.video_info);
-        let status_text = Arc::clone(&self.status_text);
+        // No longer need to share these with the bus watch
+        // Just use the sender
+        let sender = Arc::clone(&self.message_sender);
         let pipeline_clone = self.pipeline.clone();
+        let is_playing_clone = Arc::clone(&self.is_playing);
+        let reconnect_attempts_clone = Arc::clone(&self.reconnect_attempts); 
+        let url_clone = self.url.clone();
+        
+        // Create a position update timer using Windows
+        if let Some(controls) = &*self.gui_controls.lock().unwrap() {
+            let window = controls.window;
+            unsafe {
+                SetTimer(Some(window), 1, 500, None); // Check for messages every 500ms
+                SetTimer(Some(window), 2, 500, None); // Update position every 500ms
+            }
+        }
         
         let _bus_watch = bus.add_watch(move |_, msg| {
             use gstreamer::MessageView;
@@ -167,74 +588,78 @@ impl RtspPlayer {
             match msg.view() {
                 MessageView::Eos(..) => {
                     println!("End of stream");
-                    *is_playing.lock().unwrap() = false;
-                    *status_text.lock().unwrap() = String::from("End of stream");
+                    if let Ok(sender) = sender.lock() {
+                        let _ = sender.send(PlayerMessage::EndOfStream);
+                    }
+                    *is_playing_clone.lock().unwrap() = false;
                 }
                 MessageView::Error(err) => {
                     println!("Error: {} ({:?})", err.error(), err.debug());
-                    *status_text.lock().unwrap() = format!("Error: {}", err.error());
+                    
+                    if let Ok(sender) = sender.lock() {
+                        let _ = sender.send(PlayerMessage::Error(err.error().to_string()));
+                    }
                     
                     // If currently playing, try to reconnect
-                    if *is_playing.lock().unwrap() {
-                        let mut attempts = reconnect_attempts.lock().unwrap();
+                    if *is_playing_clone.lock().unwrap() {
+                        let mut attempts = reconnect_attempts_clone.lock().unwrap();
                         if *attempts < 5 {
                             *attempts += 1;
                             println!("Attempting to reconnect (attempt {}/5)...", *attempts);
-                            *status_text.lock().unwrap() = format!("Reconnecting ({}/5)...", *attempts);
+                            
+                            if let Ok(sender) = sender.lock() {
+                                let _ = sender.send(PlayerMessage::Reconnecting(*attempts));
+                            }
                             
                             // Reset the pipeline
                             let _ = pipeline_clone.set_state(gst::State::Null);
                             std::thread::sleep(Duration::from_secs(2));
                             
-                            // Create a new source element
-                            let src_str = format!(
-                                "rtspsrc location={} latency=100 protocols=tcp+udp+http buffer-mode=auto retry=5 timeout=5000000",
-                                url_clone
-                            );
-                            
-                            match gst::parse::launch(&src_str) {
-                                Ok(_) => {
-                                    println!("Reconnection attempt successful");
-                                    let _ = pipeline_clone.set_state(gst::State::Playing);
-                                }
-                                Err(e) => {
-                                    println!("Failed to reconnect: {}", e);
-                                    if *attempts >= 5 {
-                                        println!("Max reconnection attempts reached, giving up");
-                                        *status_text.lock().unwrap() = String::from("Connection failed");
-                                    }
-                                }
-                            }
+                            // Try to play again
+                            let _ = pipeline_clone.set_state(gst::State::Playing);
                         } else {
                             println!("Max reconnection attempts reached, giving up");
-                            *status_text.lock().unwrap() = String::from("Connection failed");
+                            if let Ok(sender) = sender.lock() {
+                                let _ = sender.send(PlayerMessage::ConnectionFailed);
+                            }
+                            *is_playing_clone.lock().unwrap() = false;
                         }
                     }
                 }
                 MessageView::StateChanged(state_changed) => {
                     // Only process messages from the pipeline
-                    if let Some(pipeline) = msg.src().and_then(|s| s.dynamic_cast::<gst::Pipeline>().ok()) {
-                        if pipeline == pipeline_clone && state_changed.current() == gst::State::Playing {
-                            // Reset reconnect counter when we successfully reach playing state
-                            *reconnect_attempts.lock().unwrap() = 0;
+                    if let Some(pipeline) = msg.src().and_then(|s| s.clone().dynamic_cast::<gst::Pipeline>().ok()) {
+                        if pipeline == pipeline_clone {
+                            if let Ok(sender) = sender.lock() {
+                                let _ = sender.send(PlayerMessage::StateChanged(state_changed.current()));
+                            }
+                            
+                            if state_changed.current() == gst::State::Playing {
+                                // Reset reconnect counter when we successfully reach playing state
+                                *reconnect_attempts_clone.lock().unwrap() = 0;
+                            }
                         }
                     }
                 }
                 MessageView::StreamStart(_) => {
                     println!("Stream started successfully");
-                    *status_text.lock().unwrap() = String::from("Stream started");
+                    if let Ok(sender) = sender.lock() {
+                        let _ = sender.send(PlayerMessage::StreamStarted);
+                    }
                 }
                 MessageView::Buffering(buffering) => {
                     let percent = buffering.percent();
                     println!("Buffering... {}%", percent);
-                    *status_text.lock().unwrap() = format!("Buffering... {}%", percent);
+                    
+                    if let Ok(sender) = sender.lock() {
+                        let _ = sender.send(PlayerMessage::Buffering(percent));
+                    }
                     
                     // Pause the pipeline if buffering and resume when done
                     if percent < 100 {
                         let _ = pipeline_clone.set_state(gst::State::Paused);
-                    } else if *is_playing.lock().unwrap() {
+                    } else if *is_playing_clone.lock().unwrap() {
                         let _ = pipeline_clone.set_state(gst::State::Playing);
-                        *status_text.lock().unwrap() = String::from("Playing");
                     }
                 }
                 MessageView::Element(element) => {
@@ -247,16 +672,13 @@ impl RtspPlayer {
                                 structure.get::<f64>("framerate").ok(),
                                 structure.get::<String>("codec").ok(),
                             ) {
-                                let mut info = video_info.lock().unwrap();
-                                *info = Some(VideoInfo {
-                                    width,
-                                    height,
-                                    framerate,
-                                    codec,
-                                });
-                                
                                 println!("Video info: {}x{} @ {:.2} fps, codec: {}", 
                                     width, height, framerate, codec);
+                                    
+                                if let Ok(sender) = sender.lock() {
+                                    let _ = sender.send(PlayerMessage::VideoInfo(
+                                        width, height, framerate, codec));
+                                }
                             }
                         }
                     }
@@ -269,211 +691,291 @@ impl RtspPlayer {
         
         Ok(())
     }
-    
+
+    fn handle_window_message(&self, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        match message {
+            WM_COMMAND => {
+                let control_id = LOWORD(wparam.0 as u32) as u16;
+                match control_id {
+                    ID_PLAY_BUTTON => {
+                        let _ = self.resume();
+                        LRESULT(0)
+                    },
+                    ID_PAUSE_BUTTON => {
+                        let _ = self.pause();
+                        LRESULT(0)
+                    },
+                    ID_STOP_BUTTON => {
+                        let _ = self.stop();
+                        LRESULT(0)
+                    },
+                    _ => unsafe { DefWindowProcA(hwnd, message, wparam, lparam) }
+                }
+            },
+            WM_HSCROLL => {
+                if let Some(controls) = &*self.gui_controls.lock().unwrap() {
+                    if lparam.0 as isize == controls.seekbar.0 as isize {
+                        let notify_code = LOWORD(wparam.0 as u32);
+                        match notify_code as u32 {
+                            TB_THUMBPOSITION | TB_THUMBTRACK => {
+                                let position = HIWORD(wparam.0 as u32) as f64 / 1000.0;
+                                let _ = self.seek(position);
+                            },
+                            TB_ENDTRACK => {
+                                // Get the current position from the trackbar
+                                let position = unsafe { 
+                                    SendMessageA(controls.seekbar, TBM_GETTICPOS, WPARAM(0), LPARAM(0)).0
+                                } as f64 / 1000.0;
+                                let _ = self.seek(position);
+                            },
+                            _ => {}
+                        }
+                    }
+                }
+                LRESULT(0)
+            },
+            WM_TIMER => {
+                match wparam.0 {
+                    1 => {
+                        // Timer 1: Process messages from the GStreamer bus thread
+                        self.process_player_messages();
+                    },
+                    2 => {
+                        // Timer 2: Update position information
+                        if self.is_playing() {
+                            if let Some(pos) = self.pipeline.query_position::<gst::ClockTime>() {
+                                let pos_secs = pos.seconds();
+                                *self.position.lock().unwrap() = pos_secs;
+                                
+                                // Get duration 
+                                if let Some(dur) = self.pipeline.query_duration::<gst::ClockTime>() {
+                                    let dur_secs = dur.seconds();
+                                    *self.duration.lock().unwrap() = dur_secs;
+                                    
+                                    if dur_secs > 0 && dur_secs > pos_secs {
+                                        // Update position slider
+                                        if let Some(controls) = &*self.gui_controls.lock().unwrap() {
+                                            let slider_value = ((pos_secs as f64 / dur_secs as f64) * 1000.0) as i32;
+                                            unsafe {
+                                                SendMessageA(
+                                                    controls.seekbar, 
+                                                    TBM_SETPOS,
+                                                    WPARAM(1), // TRUE to redraw
+                                                    LPARAM(slider_value as isize)
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    _ => {}
+                }
+                LRESULT(0)
+            },
+            // ... other message handlers remain the same
+            WM_SIZE => {
+                // Resize video window when main window is resized
+                if let Some(controls) = &*self.gui_controls.lock().unwrap() {
+                    let width = LOWORD(lparam.0 as u32) as i32;
+                    let height = HIWORD(lparam.0 as u32) as i32;
+                    
+                    // Resize video area
+                    unsafe {
+                        MoveWindow(
+                            controls.video_window,
+                            0, 0,
+                            width,
+                            height - 100, // Leave space for controls
+                            true
+                        );
+                        
+                        // Reposition controls
+                        let control_y = height - 90;
+                        
+                        MoveWindow(
+                            controls.play_button,
+                            10, control_y,
+                            100, 30,
+                            true
+                        );
+                        
+                        MoveWindow(
+                            controls.pause_button,
+                            120, control_y,
+                            100, 30,
+                            true
+                        );
+                        
+                        MoveWindow(
+                            controls.stop_button,
+                            230, control_y,
+                            100, 30,
+                            true
+                        );
+                        
+                        MoveWindow(
+                            controls.seekbar,
+                            340, control_y,
+                            width - 350, 30,
+                            true
+                        );
+                        
+                        MoveWindow(
+                            controls.status_text,
+                            10, control_y + 40,
+                            width - 20, 20,
+                            true
+                        );
+                    }
+                }
+                LRESULT(0)
+            },
+            WM_DESTROY => {
+                // Stop playback and quit
+                let _ = self.stop();
+                unsafe { PostQuitMessage(0) };
+                LRESULT(0)
+            },
+            _ => unsafe { DefWindowProcA(hwnd, message, wparam, lparam) }
+        }
+    }
+
+    // New method to process messages from the channel
+    fn process_player_messages(&self) {
+        // Try to receive all pending messages without blocking
+        while let Ok(msg) = self.message_receiver.try_recv() {
+            if let Some(controls) = &*self.gui_controls.lock().unwrap() {
+                match msg {
+                    PlayerMessage::EndOfStream => {
+                        unsafe {
+                            SetWindowTextA(controls.status_text, PCSTR(b"End of stream\0".as_ptr()));
+                        }
+                    },
+                    PlayerMessage::Error(error_msg) => {
+                        let text = format!("Error: {}\0", error_msg);
+                        unsafe {
+                            SetWindowTextA(controls.status_text, PCSTR(text.as_ptr()));
+                        }
+                    },
+                    PlayerMessage::StreamStarted => {
+                        unsafe {
+                            SetWindowTextA(controls.status_text, PCSTR(b"Stream started\0".as_ptr()));
+                        }
+                    },
+                    PlayerMessage::Buffering(percent) => {
+                        let text = format!("Buffering... {}%\0", percent);
+                        unsafe {
+                            SetWindowTextA(controls.status_text, PCSTR(text.as_ptr()));
+                        }
+                    },
+                    PlayerMessage::StateChanged(state) => {
+                        match state {
+                            gst::State::Playing => {
+                                unsafe {
+                                    SetWindowTextA(controls.status_text, PCSTR(b"Playing\0".as_ptr()));
+                                }
+                            },
+                            gst::State::Paused => {
+                                unsafe {
+                                    SetWindowTextA(controls.status_text, PCSTR(b"Paused\0".as_ptr()));
+                                }
+                            },
+                            gst::State::Ready => {
+                                unsafe {
+                                    SetWindowTextA(controls.status_text, PCSTR(b"Ready\0".as_ptr()));
+                                }
+                            },
+                            gst::State::Null => {
+                                unsafe {
+                                    SetWindowTextA(controls.status_text, PCSTR(b"Stopped\0".as_ptr()));
+                                }
+                            },
+                            _ => {}
+                        }
+                    },
+                    PlayerMessage::VideoInfo(width, height, framerate, codec) => {
+                        // Update video information in UI
+                        let text = format!("{}x{} @ {:.2} fps ({})\0", width, height, framerate, codec);
+                        unsafe {
+                            SetWindowTextA(controls.status_text, PCSTR(text.as_ptr()));
+                        }
+                        
+                        // Store video info
+                        let mut info = self.video_info.lock().unwrap();
+                        *info = Some(VideoInfo {
+                            width,
+                            height,
+                            framerate,
+                            codec,
+                        });
+                    },
+                    PlayerMessage::Reconnecting(attempt) => {
+                        let text = format!("Reconnecting ({}/5)...\0", attempt);
+                        unsafe {
+                            SetWindowTextA(controls.status_text, PCSTR(text.as_ptr()));
+                        }
+                    },
+                    PlayerMessage::ConnectionFailed => {
+                        unsafe {
+                            SetWindowTextA(controls.status_text, PCSTR(b"Connection failed\0".as_ptr()));
+                        }
+                    },
+                    PlayerMessage::PositionUpdate(pos, dur) => {
+                        // This is handled by the position timer (timer 2)
+                    },
+                }
+            }
+        }
+    }
+
     fn get_video_info(&self) -> Option<VideoInfo> {
-        self.video_info.lock().unwrap().clone()
+        self.video_info.lock()
+            .ok()
+            .map(|x|x.clone().unwrap())
+            // .unwrap()//.clone()
     }
     
     fn is_playing(&self) -> bool {
         *self.is_playing.lock().unwrap()
     }
-    
-    fn get_position_percent(&self) -> f64 {
-        let position = *self.position.lock().unwrap();
-        let duration = *self.duration.lock().unwrap();
+}
+
+extern "system" fn window_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if message == WM_CREATE {
+        // Store the RtspPlayer instance pointer in the window's user data
+        let create_struct = unsafe { &*(lparam.0 as *const CREATESTRUCTA) };
+        let player_ptr_ptr = create_struct.lpCreateParams as *const *const RtspPlayer;
+        let player_ptr = unsafe { *player_ptr_ptr };
         
-        if duration > 0 {
-            (position as f64 / duration as f64) * 100.0
-        } else {
-            0.0
+        unsafe {
+            SetWindowLongPtrA(hwnd, GWLP_USERDATA, player_ptr as isize);
         }
+        
+        return LRESULT(0);
     }
     
-    fn get_status_text(&self) -> String {
-        self.status_text.lock().unwrap().clone()
+    // Get the RtspPlayer instance from the window's user data
+    let player_ptr = unsafe { GetWindowLongPtrA(hwnd, GWLP_USERDATA) } as *const RtspPlayer;
+    
+    if !player_ptr.is_null() {
+        let player = unsafe { &*player_ptr };
+        return player.handle_window_message(hwnd, message, wparam, lparam);
     }
     
-    fn update_position(&self) {
-        if let Ok(Some(pos)) = self.pipeline.query_position::<gst::ClockTime>() {
-            let pos_secs = pos.seconds();
-            *self.position.lock().unwrap() = pos_secs;
-            
-            // Get duration 
-            if let Ok(Some(dur)) = self.pipeline.query_duration::<gst::ClockTime>() {
-                let dur_secs = dur.seconds();
-                *self.duration.lock().unwrap() = dur_secs;
-            }
-        }
+    unsafe { DefWindowProcA(hwnd, message, wparam, lparam) }
+}
+
+fn check_win_err() -> std::result::Result<(), Box<dyn Error>> {
+    let last_error = unsafe { GetLastError() };
+    if last_error != ERROR_SUCCESS {
+        return Err(Box::new(PlayerError::WindowsError(format!("Windows API error: 0x{:08x}", last_error.0))));
     }
+    Ok(())
 }
 
-fn create_window_and_device() -> Result<(EventLoop<()>, Window, Device, Queue, Surface, TextureFormat), Box<dyn Error>> {
-    let event_loop = EventLoop::new();
-    
-    let window = WindowBuilder::new()
-        .with_title("RTSP Player")
-        .with_inner_size(LogicalSize::new(800.0, 600.0))
-        .build(&event_loop)?;
-    
-    // Set up wgpu instance
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::all(),
-        dx12_shader_compiler: Default::default(),
-    });
-    
-    // Create surface
-    let surface = unsafe { instance.create_surface(&window) }?;
-    
-    // Request adapter
-    let adapter = pollster::block_on(instance.request_adapter(
-        &wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-        },
-    )).ok_or_else(|| PlayerError::WindowError("Failed to find an appropriate adapter".into()))?;
-    
-    // Create device and queue
-    let (device, queue) = pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            features: wgpu::Features::empty(),
-            limits: wgpu::Limits::default(),
-            label: None,
-        },
-        None,
-    ))?;
-    
-    // Configure surface
-    let size = window.inner_size();
-    let surface_caps = surface.get_capabilities(&adapter);
-    let surface_format = surface_caps.formats.iter()
-        .copied()
-        .find(|f| f.is_srgb())
-        .unwrap_or(surface_caps.formats[0]);
-    
-    let config = wgpu::SurfaceConfiguration {
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        format: surface_format,
-        width: size.width,
-        height: size.height,
-        present_mode: wgpu::PresentMode::Fifo,
-        alpha_mode: wgpu::CompositeAlphaMode::Auto,
-        view_formats: vec![],
-    };
-    
-    surface.configure(&device, &config);
-    
-    Ok((event_loop, window, device, queue, surface, surface_format))
-}
-
-fn run_gui_loop(
-    event_loop: EventLoop<()>,
-    window: Window,
-    player: Arc<RtspPlayer>
-) -> Result<(), Box<dyn Error>> {
-    // Start the GStreamer pipeline
-    player.play()?;
-    
-    // Create position update thread
-    let player_clone = Arc::clone(&player);
-    std::thread::spawn(move || {
-        loop {
-            if player_clone.is_playing() {
-                player_clone.update_position();
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-    });
-    
-    // Set up GUI state
-    let mut gui_state = {
-        let size = window.inner_size();
-        
-        // Define button positions and sizes
-        let play_button_rect = (20.0, size.height as f32 - 60.0, 80.0, 40.0);
-        let pause_button_rect = (110.0, size.height as f32 - 60.0, 80.0, 40.0);
-        
-        GuiState {
-            device: wgpu::Device::new(),
-            queue: wgpu::Queue::new(),
-            surface: wgpu::Surface::new(),
-            surface_format: wgpu::TextureFormat::Rgba8Unorm,
-            size,
-            play_button_rect,
-            pause_button_rect,
-            is_seeking: false,
-            seek_position: 0.0,
-        }
-    };
-    
-    // Run the event loop
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Poll;
-        
-        match event {
-            Event::WindowEvent { window_id, event } if window_id == window.id() => {
-                match event {
-                    WindowEvent::CloseRequested => {
-                        let _ = player.stop();
-                        *control_flow = ControlFlow::Exit;
-                    }
-                    WindowEvent::Resized(new_size) => {
-                        gui_state.size = new_size;
-                        // Update seek bar and button positions based on new size
-                        gui_state.play_button_rect.1 = new_size.height as f32 - 60.0;
-                        gui_state.pause_button_rect.1 = new_size.height as f32 - 60.0;
-                    }
-                    WindowEvent::MouseInput { state: winit::event::ElementState::Pressed, .. } => {
-                        // Check if buttons were clicked
-                        if let Some(cursor_position) = window.cursor_position() {
-                            // Check play button
-                            if point_in_rect(cursor_position, gui_state.play_button_rect) {
-                                let _ = player.resume();
-                            }
-                            // Check pause button
-                            else if point_in_rect(cursor_position, gui_state.pause_button_rect) {
-                                let _ = player.pause();
-                            }
-                            // Check seek bar (positioned at the bottom of the window)
-                            else {
-                                let seek_bar_y = gui_state.size.height as f32 - 100.0;
-                                let seek_bar_height = 20.0;
-                                
-                                if cursor_position.y >= seek_bar_y && cursor_position.y <= seek_bar_y + seek_bar_height {
-                                    let seek_percent = (cursor_position.x as f32 / gui_state.size.width as f32) * 100.0;
-                                    gui_state.is_seeking = true;
-                                    gui_state.seek_position = seek_percent;
-                                    
-                                    // Perform the seek
-                                    let _ = player.seek(seek_percent as f64);
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Event::RedrawRequested(window_id) if window_id == window.id() => {
-                // This would be where we'd redraw our UI if needed
-                // Since we're using GStreamer's d3d11videosink, it will handle the video rendering
-                // We would add UI elements on top if needed
-            }
-            Event::MainEventsCleared => {
-                // Request a redraw
-                window.request_redraw();
-            }
-            _ => {}
-        }
-    });
-}
-
-fn point_in_rect(point: PhysicalPosition<f64>, rect: (f32, f32, f32, f32)) -> bool {
-    let (x, y, width, height) = rect;
-    point.x >= x as f64 && point.x <= (x + width) as f64 && 
-    point.y >= y as f64 && point.y <= (y + height) as f64
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> std::result::Result<(), Box<dyn Error>> {
     // Get the RTSP URL from command line or use a default
     let args: Vec<String> = env::args().collect();
     let rtsp_url = if args.len() > 1 {
@@ -487,26 +989,46 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Create the RTSP player
     let player = RtspPlayer::new(&rtsp_url)?;
     
+    // Set up GUI
+    player.create_gui()?;
+    
     // Set up message handling
     player.setup_message_handling()?;
     
-    // Set up Ctrl+C handler
-    let player_for_signal = Arc::new(player);
-    let player_clone = Arc::clone(&player_for_signal);
+    // Start playback
+    player.play()?;
     
-    ctrlc::set_handler(move || {
-        println!("\nReceived Ctrl+C, shutting down...");
-        let _ = player_clone.stop();
-        std::process::exit(0);
-    })?;
-
-    // Create window and GUI
-    let (event_loop, window, device, queue, surface, surface_format) = create_window_and_device()?;
+    // Windows message loop
+    unsafe {
+        let mut msg = MSG::default();
+        while GetMessageA(&mut msg, None, 0, 0).into() {
+            let r = TranslateMessage(&msg);
+            if r.0 != 0 {
+                println!("TranslateMessage returned {}", r.0);
+            }
+            DispatchMessageA(&msg);
+        }
+    }
     
-    // Run the main event loop
-    run_gui_loop(event_loop, window, player_for_signal)?;
+    // Clean up
+    player.stop()?;
     
     Ok(())
+}
+
+// Helper function to get LOWORD
+fn LOWORD(dword: u32) -> u16 {
+    (dword & 0xFFFF) as u16
+}
+
+// Helper function to get HIWORD
+fn HIWORD(dword: u32) -> u16 {
+    ((dword >> 16) & 0xFFFF) as u16
+}
+
+// Helper function for MAKELONG
+fn MAKELONG(low: u16, high: u16) -> u32 {
+    ((high as u32) << 16) | (low as u32)
 }
 
 // For testing
