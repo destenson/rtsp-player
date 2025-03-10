@@ -1,15 +1,13 @@
 [package]
-name = "rtsp-player"
+name = "player"
 version = "0.1.0"
 edition = "2024"
-description = "Stream videos to a window."
 
 [dependencies]
 gstreamer = "0.23.5"
 gstreamer-video = "0.23.5"
 glib = "0.20.9"
 ctrlc = "3.2.0"
-player.path = "crates/player"
 reqwest = { version = "0.12.12", features = ["blocking", "json"] }
 serde = "1.0.218"
 serde_json = "1.0.140"
@@ -22,29 +20,3 @@ windows = { version = "0.60", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 tokio = { version = "1.44.0", features = ["full"]}
-
-[workspace]
-members = [
-    ".",
-    "crates/player",
-    "crates/player-sys",
-    "crates/player_net",
-]
-
-[profile.dev]
-opt-level = 0
-debug = true
-overflow-checks = true
-lto = false
-debug-assertions = true
-panic = "unwind"
-
-[profile.release]
-opt-level = 3
-debug = false
-overflow-checks = false
-lto = true
-debug-assertions = false
-panic = "abort"
-
-
